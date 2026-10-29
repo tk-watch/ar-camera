@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- 2026-10-30 ChatGPT（Work・GPT-6 Astra 軽）に作らせた簡易版。カメラ映像に画像を重ねて写真・録画する。https で開く前提 -->
+<!-- 2026-10-30 ChatGPT（Work・GPT-6 Astra 軽）に作らせた簡易版。カメラ映像に画像・動画（背景が透明な WebM）を重ねて写真・録画する。https で開く前提 -->
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
@@ -38,11 +38,12 @@ border: 2px dashed #49e3ff;
 transform-origin: center;
 display: none;
 }
-#source {
+.hidden-video {
 position: fixed;
 width: 1px;
 height: 1px;
 left: -10px;
+top: 0;
 opacity: 0;
 pointer-events: none;
 }
@@ -53,8 +54,9 @@ left: 12px;
 right: 12px;
 pointer-events: none;
 }
-#status {
-display: inline-block;
+#status, #playNotice {
+display: block;
+width: fit-content;
 max-width: 100%;
 padding: 9px 12px;
 background: #000b;
@@ -62,6 +64,11 @@ border-radius: 12px;
 font-size: 14px;
 line-height: 1.6;
 white-space: pre-line;
+}
+#playNotice {
+display: none;
+margin-top: 8px;
+color: #ffe28a;
 }
 #timer {
 display: none;
@@ -105,6 +112,7 @@ background: #303641;
 touch-action: manipulation;
 -webkit-tap-highlight-color: transparent;
 }
+button { padding: 8px 4px; }
 button:disabled { opacity: .4; }
 #record { background: #b71f36; }
 #photo { background: #126c90; }
@@ -123,9 +131,9 @@ input { display: none; }
 </style>
 </head>
 <body>
-<video id="source" autoplay muted playsinline></video>
+<video id="source" class="hidden-video" autoplay muted playsinline></video>
 
-<main id="stage" aria-label="カメラと画像の合成画面">
+<main id="stage" aria-label="カメラと画像・動画の合成画面">
 <canvas id="canvas" width="720" height="1280"></canvas>
 <div id="selection"></div>
 </main>
@@ -134,13 +142,16 @@ input { display: none; }
 <div id="status" role="status" aria-live="polite">
 カメラを起動しています…
 </div>
+<div id="playNotice" role="status" aria-live="polite">
+画面をタップすると動き始めます
+</div>
 <div id="timer" role="timer">● 録画中 0秒</div>
 </div>
 
 <div id="bottom">
-<p id="help">画像をタップして選択・１本指で移動・２本指で拡大縮小と回転</p>
+<p id="help">タップして選択・１本指で移動・２本指で拡大縮小と回転</p>
 <div id="buttons">
-<button id="add">画像を追加</button>
+<button id="add">画像・動画を追加</button>
 <button id="remove" disabled>選択を削除</button>
 <button id="switch" disabled>前面へ切替</button>
 <button id="record" disabled>録画</button>
@@ -150,7 +161,7 @@ input { display: none; }
 <a id="download">保存できない場合はここをタップ</a>
 </div>
 
-<input id="files" type="file" accept="image/*" multiple>
+<input id="files" type="file" accept="image/*,video/*" multiple>
 
 <script>
 "use strict";
@@ -158,7 +169,7 @@ input { display: none; }
 const $ = id => document.getElementById(id);
 const canvas = $("canvas");
 const ctx = canvas.getContext("2d", { alpha: false });
-const video = $("source");
+const cameraVideo = $("source");
 const stage = $("stage");
 const selection = $("selection");
 const W = canvas.width;
@@ -172,11 +183,11 @@ let recorder = null;
 let recordingStream = null;
 let microphone = null;
 let timerID = null;
-let startedAt = 0;
 let downloadURL = null;
 let selected = null;
 let gesture = null;
-let images = [];
+let items = [];
+
 const pointers = new Map();
 
 function message(text) {
@@ -190,7 +201,7 @@ if (stream) stream.getTracks().forEach(track => track.stop());
 function cameraReady() {
 return !!camera &&
 camera.getVideoTracks().some(track => track.readyState === "live") &&
-video.readyState >= 2;
+cameraVideo.readyState >= 2;
 }
 
 function recording() {
@@ -236,9 +247,13 @@ return;
 cameraBusy = true;
 updateButtons();
 message("カメラの許可を確認しています…");
+
+if (camera) {
+camera.getVideoTracks().forEach(track => { track.onended = null; });
+}
 stopTracks(camera);
 camera = null;
-video.srcObject = null;
+cameraVideo.srcObject = null;
 
 try {
 camera = await navigator.mediaDevices.getUserMedia({
@@ -251,19 +266,20 @@ frameRate: { ideal: 30, max: 30 }
 audio: false
 });
 
-video.srcObject = camera;
-await video.play();
+cameraVideo.srcObject = camera;
+await cameraVideo.play();
 
-const actual = camera.getVideoTracks()[0].getSettings().facingMode;
+const track = camera.getVideoTracks()[0];
+const actual = track.getSettings().facingMode;
 facing = actual === "user" || actual === "environment" ? actual : target;
 
-camera.getVideoTracks()[0].addEventListener("ended", () => {
+track.onended = () => {
 if (recorder?.state === "recording") stopRecording();
 message("カメラが停止しました。「カメラ再開」を押してください。");
 updateButtons();
-});
+};
 
-message("画像を追加して重ねられます。撮影・録画は縦長の画面全体を保存します。");
+message("画像・動画を追加して重ねられます。写真・録画は縦長の合成画面を保存します。");
 } catch (error) {
 stopTracks(camera);
 camera = null;
@@ -278,33 +294,57 @@ function drawComposition() {
 ctx.fillStyle = "#000";
 ctx.fillRect(0, 0, W, H);
 
-if (video.readyState >= 2 && video.videoWidth && video.videoHeight) {
-const vw = video.videoWidth;
-const vh = video.videoHeight;
+if (cameraVideo.readyState >= 2 &&
+cameraVideo.videoWidth && cameraVideo.videoHeight) {
+const vw = cameraVideo.videoWidth;
+const vh = cameraVideo.videoHeight;
 const scale = Math.max(W / vw, H / vh);
 const sw = W / scale;
 const sh = H / scale;
 
 // 前面カメラも保存画像と同じ向きで表示する。
 ctx.drawImage(
-video,
+cameraVideo,
 (vw - sw) / 2, (vh - sh) / 2, sw, sh,
 0, 0, W, H
 );
 }
 
-for (const item of images) {
+for (const item of items) {
+if (!item.ready || item.disposed || item.failed) continue;
+
+let width = item.w;
+let height = item.h;
+
+if (item.kind === "video") {
+// 読み込み前は描かず、動画要素を直接使用する。
+if (item.media.readyState < 2 ||
+!item.media.videoWidth || !item.media.videoHeight) continue;
+width = item.media.videoWidth;
+height = item.media.videoHeight;
+item.w = width;
+item.h = height;
+}
+
 ctx.save();
+try {
+ctx.globalCompositeOperation = "source-over";
 ctx.translate(item.x, item.y);
 ctx.rotate(item.angle);
 ctx.scale(item.scale, item.scale);
-ctx.drawImage(item.image, -item.w / 2, -item.h / 2, item.w, item.h);
+
+// デコードされたアルファをそのままカメラ映像に合成する。
+ctx.drawImage(item.media, -width / 2, -height / 2, width, height);
+} catch {
+// 動画の読み込み状態が変わったフレームはスキップする。
+} finally {
 ctx.restore();
+}
 }
 }
 
 function drawSelection() {
-if (!selected) {
+if (!selected || !selected.ready) {
 selection.style.display = "none";
 return;
 }
@@ -331,51 +371,225 @@ requestAnimationFrame(render);
 }
 requestAnimationFrame(render);
 
-$("add").onclick = () => $("files").click();
-
-$("files").onchange = async event => {
-const files = Array.from(event.target.files || []);
-event.target.value = "";
-
-for (const file of files) {
-const url = URL.createObjectURL(file);
-try {
-const img = new Image();
-img.src = url;
-await img.decode();
-
-// 大きな画像を縮小し、メモリ消費を抑える。
-const ratio = Math.min(1, 2048 / Math.max(img.naturalWidth, img.naturalHeight));
-const bitmap = document.createElement("canvas");
-bitmap.width = Math.max(1, Math.round(img.naturalWidth * ratio));
-bitmap.height = Math.max(1, Math.round(img.naturalHeight * ratio));
-bitmap.getContext("2d").drawImage(img, 0, 0, bitmap.width, bitmap.height);
-
-const item = {
-image: bitmap,
-w: bitmap.width,
-h: bitmap.height,
+function makeItem(kind, media, url = null) {
+return {
+kind,
+media,
+url,
+w: 0,
+h: 0,
 x: W / 2,
 y: H / 2,
-scale: Math.min(W * .6 / bitmap.width, H * .45 / bitmap.height),
-angle: 0
+scale: 1,
+angle: 0,
+ready: false,
+disposed: false,
+failed: false,
+blocked: false,
+playPending: false,
+playVersion: 0
 };
-images.push(item);
-selected = item;
+}
+
+function initializeSize(item, width, height) {
+item.w = width;
+item.h = height;
+item.scale = Math.min(W * .6 / width, H * .45 / height);
+item.ready = true;
+}
+
+function updatePlayNotice() {
+$("playNotice").style.display =
+items.some(item => item.kind === "video" && item.blocked &&
+!item.disposed && !item.failed) ? "block" : "none";
+}
+
+function tryPlay(item) {
+if (item.kind !== "video" || item.disposed || item.failed ||
+document.hidden || item.playPending) return;
+
+item.playPending = true;
+const version = ++item.playVersion;
+
+let result;
+try {
+// ここで直ちに呼び、タップによるユーザー操作を維持する。
+result = item.media.play();
+} catch (error) {
+item.playPending = false;
+handlePlayError(item, error);
+return;
+}
+
+Promise.resolve(result).then(() => {
+if (item.disposed || version !== item.playVersion) return;
+item.blocked = false;
+updatePlayNotice();
+}).catch(error => {
+if (item.disposed || version !== item.playVersion) return;
+handlePlayError(item, error);
+}).finally(() => {
+if (version === item.playVersion) item.playPending = false;
+});
+}
+
+function handlePlayError(item, error) {
+if (item.disposed || document.hidden) return;
+
+if (error.name === "NotSupportedError") {
+item.failed = true;
+item.blocked = false;
+message("この動画の形式は再生できません。対応するWebMやMP4を選んでください。");
+} else {
+item.blocked = true;
+}
+updatePlayNotice();
+}
+
+function pauseItem(item) {
+if (item.kind !== "video" || item.disposed) return;
+item.playVersion++;
+item.playPending = false;
+item.media.pause();
+}
+
+function disposeItem(item) {
+if (item.disposed) return;
+if (item.kind === "video") {
+pauseItem(item);
+item.disposed = true;
+item.media.onloadedmetadata = null;
+item.media.onloadeddata = null;
+item.media.onerror = null;
+item.media.removeAttribute("src");
+item.media.load();
+item.media.remove();
+} else {
+item.disposed = true;
+}
+if (item.url) {
+URL.revokeObjectURL(item.url);
+item.url = null;
+}
+}
+
+function addVideo(file) {
+const media = document.createElement("video");
+media.className = "hidden-video";
+media.muted = true;
+media.defaultMuted = true;
+media.volume = 0;
+media.loop = true;
+media.playsInline = true;
+media.preload = "auto";
+media.setAttribute("muted", "");
+media.setAttribute("loop", "");
+media.setAttribute("playsinline", "");
+media.setAttribute("aria-hidden", "true");
+
+const item = makeItem("video", media, URL.createObjectURL(file));
+items.push(item);
+
+media.onloadedmetadata = () => {
+if (item.disposed) return;
+if (media.videoWidth && media.videoHeight) {
+initializeSize(item, media.videoWidth, media.videoHeight);
+if (pointers.size === 0) selected = item;
+updateButtons();
+}
+};
+
+media.onloadeddata = () => {
+if (!item.blocked) tryPlay(item);
+};
+
+media.onerror = () => {
+if (item.disposed) return;
+if (selected === item) {
+selected = null;
+gesture = null;
+}
+items = items.filter(candidate => candidate !== item);
+disposeItem(item);
+updateButtons();
+updatePlayNotice();
+message("動画を読み込めませんでした。対応するWebMやMP4を選んでください。");
+};
+
+document.body.appendChild(media);
+media.src = item.url;
+media.load();
+tryPlay(item);
+}
+
+async function addImage(file) {
+const url = URL.createObjectURL(file);
+try {
+const image = new Image();
+image.src = url;
+await image.decode();
+
+// 静止画像のみ縮小コピーを作る。動画にはこの処理を使わない。
+const ratio = Math.min(
+1, 2048 / Math.max(image.naturalWidth, image.naturalHeight)
+);
+const bitmap = document.createElement("canvas");
+bitmap.width = Math.max(1, Math.round(image.naturalWidth * ratio));
+bitmap.height = Math.max(1, Math.round(image.naturalHeight * ratio));
+bitmap.getContext("2d").drawImage(
+image, 0, 0, bitmap.width, bitmap.height
+);
+
+const item = makeItem("image", bitmap);
+initializeSize(item, bitmap.width, bitmap.height);
+items.push(item);
+if (pointers.size === 0) selected = item;
 updateButtons();
 } catch {
-message("読み込めない画像がありました。PNGやJPEGなどの画像を選んでください。");
+message("読み込めない画像がありました。PNGやJPEGなどを選んでください。");
 } finally {
 URL.revokeObjectURL(url);
 }
 }
+
+$("add").onclick = () => $("files").click();
+
+$("files").onchange = event => {
+const files = Array.from(event.target.files || []);
+event.target.value = "";
+
+for (const file of files) {
+const isVideo = file.type.startsWith("video/") ||
+(!file.type && /\.(webm|mp4|m4v|mov|ogv|3gp|mkv)$/i.test(file.name));
+
+if (isVideo) {
+try {
+addVideo(file);
+} catch {
+message("動画を追加できませんでした。別の動画でお試しください。");
+}
+} else {
+addImage(file);
+}
+}
 };
 
+// 自動再生が拒否された動画は、次のタップでまとめて再試行する。
+document.addEventListener("pointerdown", () => {
+for (const item of items) {
+if (item.kind === "video" && item.blocked) tryPlay(item);
+}
+}, { capture: true, passive: true });
+
 $("remove").onclick = () => {
-images = images.filter(item => item !== selected);
+if (!selected) return;
+const item = selected;
 selected = null;
 gesture = null;
+items = items.filter(candidate => candidate !== item);
+disposeItem(item);
 updateButtons();
+updatePlayNotice();
 };
 
 function position(event) {
@@ -387,6 +601,7 @@ y: (event.clientY - rect.top) * H / rect.height
 }
 
 function hitTest(point, item) {
+if (!item.ready || item.disposed || item.failed) return false;
 const dx = point.x - item.x;
 const dy = point.y - item.y;
 const c = Math.cos(item.angle);
@@ -429,17 +644,17 @@ stage.addEventListener("pointerdown", event => {
 event.preventDefault();
 if (pointers.size >= 2) return;
 
-const p = position(event);
+const point = position(event);
 if (pointers.size === 0) {
-selected = [...images].reverse().find(item => hitTest(p, item)) || null;
+selected = [...items].reverse().find(item => hitTest(point, item)) || null;
 if (selected) {
-images = images.filter(item => item !== selected);
-images.push(selected);
+items = items.filter(item => item !== selected);
+items.push(selected);
 }
 updateButtons();
 }
 
-pointers.set(event.pointerId, p);
+pointers.set(event.pointerId, point);
 stage.setPointerCapture(event.pointerId);
 beginGesture();
 });
@@ -456,7 +671,10 @@ selected.x = gesture.x + points[0].x - gesture.start.x;
 selected.y = gesture.y + points[0].y - gesture.start.y;
 } else if (gesture.mode === 2 && points.length === 2) {
 const [a, b] = points;
-const center = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+const center = {
+x: (a.x + b.x) / 2,
+y: (a.y + b.y) / 2
+};
 const distance = Math.hypot(b.x - a.x, b.y - a.y);
 const delta = Math.atan2(b.y - a.y, b.x - a.x) - gesture.angle;
 const size = Math.max(selected.w, selected.h);
@@ -468,8 +686,10 @@ const ratio = newScale / gesture.scale;
 const dx = gesture.x - gesture.center.x;
 const dy = gesture.y - gesture.center.y;
 
-selected.x = center.x + ratio * (dx * Math.cos(delta) - dy * Math.sin(delta));
-selected.y = center.y + ratio * (dx * Math.sin(delta) + dy * Math.cos(delta));
+selected.x = center.x +
+ratio * (dx * Math.cos(delta) - dy * Math.sin(delta));
+selected.y = center.y +
+ratio * (dx * Math.sin(delta) + dy * Math.cos(delta));
 selected.scale = newScale;
 selected.angle = gesture.rotation + delta;
 }
@@ -488,16 +708,18 @@ stage.addEventListener("pointercancel", endPointer);
 stage.addEventListener("lostpointercapture", endPointer);
 
 function filename(prefix, extension) {
-const d = new Date();
+const date = new Date();
 const pad = n => String(n).padStart(2, "0");
-const stamp = d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) +
-"_" + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
+const stamp =
+date.getFullYear() + pad(date.getMonth() + 1) + pad(date.getDate()) +
+"_" + pad(date.getHours()) + pad(date.getMinutes()) + pad(date.getSeconds());
 return prefix + "_" + stamp + "." + extension;
 }
 
 function saveBlob(blob, name) {
 if (downloadURL) URL.revokeObjectURL(downloadURL);
 downloadURL = URL.createObjectURL(blob);
+
 const link = $("download");
 link.href = downloadURL;
 link.download = name;
@@ -545,6 +767,7 @@ updateButtons();
 
 try {
 message("録音のため、マイクの利用を許可してください。");
+
 try {
 microphone = await navigator.mediaDevices.getUserMedia({ audio: true });
 } catch (error) {
@@ -562,7 +785,11 @@ return;
 
 drawComposition();
 recordingStream = canvas.captureStream(30);
-microphone.getAudioTracks().forEach(track => recordingStream.addTrack(track));
+
+// 音声はマイクだけを追加する。重ねた動画の音声は追加しない。
+microphone.getAudioTracks().forEach(track => {
+recordingStream.addTrack(track);
+});
 
 const types = [
 "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
@@ -583,13 +810,11 @@ audioBitsPerSecond: 128000
 });
 break;
 } catch {
-// この形式で初期化できなければ次の形式を試す。
+// 初期化できない形式なら次を試す。
 }
 }
 
-if (!active) {
-throw new Error("対応形式なし");
-}
+if (!active) throw new Error("対応形式なし");
 
 recorder = active;
 const chunks = [];
@@ -603,7 +828,11 @@ active.onerror = () => {
 failed = true;
 message("録画中にエラーが発生しました。保存できた部分があれば出力します。");
 if (active.state !== "inactive") {
-try { active.stop(); } catch { cleanupRecording(); }
+try {
+active.stop();
+} catch {
+cleanupRecording();
+}
 }
 };
 
@@ -624,7 +853,7 @@ message("動画データがありません。少し長めに録画して再試�
 };
 
 active.start(1000);
-startedAt = performance.now();
+const startedAt = performance.now();
 $("timer").textContent = "● 録画中 0秒";
 $("timer").style.display = "block";
 timerID = setInterval(() => {
@@ -634,7 +863,7 @@ $("timer").textContent = "● 録画中 " + seconds + "秒";
 
 recordBusy = false;
 updateButtons();
-message("録画中です。画像の移動・拡大縮小・回転も記録されます。\n画面を開いたままお使いください。");
+message("録画中です。動くキャラや移動・拡大縮小・回転も記録されます。\n画面を開いたままお使いください。");
 } catch {
 cleanupRecording();
 message("録画を開始できませんでした。Chromeを更新するか、他のアプリを閉じて再試行してください。");
@@ -646,6 +875,7 @@ if (!recorder || recorder.state === "inactive") return;
 recordBusy = true;
 updateButtons();
 message("動画を保存しています…");
+
 try {
 recorder.stop();
 } catch {
@@ -666,23 +896,39 @@ startCamera(facing === "environment" ? "user" : "environment");
 $("retry").onclick = () => startCamera();
 
 document.addEventListener("visibilitychange", () => {
-if (document.hidden && recorder?.state === "recording") {
-stopRecording();
+pointers.clear();
+gesture = null;
+
+if (document.hidden) {
+// 録画は従来どおり停止し、追加動画は現在位置で一時停止する。
+if (recorder?.state === "recording") stopRecording();
+items.forEach(pauseItem);
+} else {
+// 再生位置を変更せず、その位置から続ける。
+items.forEach(tryPlay);
 }
 });
 
-window.addEventListener("pagehide", () => {
+window.addEventListener("pagehide", event => {
 if (recorder?.state === "recording") {
 try { recorder.stop(); } catch {}
 }
 stopTracks(camera);
 stopTracks(microphone);
+items.forEach(pauseItem);
+
+// 戻る操作用に保持されるページでは動画を破棄しない。
+if (!event.persisted) {
+items.forEach(disposeItem);
+if (downloadURL) URL.revokeObjectURL(downloadURL);
+}
 });
 
 window.addEventListener("pageshow", event => {
 if (event.persisted) {
 message("「カメラ再開」を押してカメラを起動してください。");
 updateButtons();
+if (!document.hidden) items.forEach(tryPlay);
 }
 });
 
