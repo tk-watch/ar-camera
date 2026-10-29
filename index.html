@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<!-- 2026-10-30 ChatGPT（Work・GPT-6 Astra 軽）に作らせた簡易版。カメラ映像に画像を重ねて写真・録画する。https で開く前提 -->
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport"
+content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>かさねてカメラ</title>
+<style>
+* { box-sizing: border-box; }
+html, body {
+margin: 0;
+width: 100%;
+height: 100%;
+overflow: hidden;
+background: #000;
+color: #fff;
+font-family: system-ui, sans-serif;
+overscroll-behavior: none;
+}
+#stage {
+position: absolute;
+inset: 0;
+margin: auto;
+width: min(100vw, 56.25dvh);
+height: min(100dvh, 177.7778vw);
+touch-action: none;
+}
+canvas {
+display: block;
+width: 100%;
+height: 100%;
+}
+#selection {
+position: absolute;
+pointer-events: none;
+border: 2px dashed #49e3ff;
+transform-origin: center;
+display: none;
+}
+#source {
+position: fixed;
+width: 1px;
+height: 1px;
+left: -10px;
+opacity: 0;
+pointer-events: none;
+}
+#top {
+position: fixed;
+top: max(10px, env(safe-area-inset-top));
+left: 12px;
+right: 12px;
+pointer-events: none;
+}
+#status {
+display: inline-block;
+max-width: 100%;
+padding: 9px 12px;
+background: #000b;
+border-radius: 12px;
+font-size: 14px;
+line-height: 1.6;
+white-space: pre-line;
+}
+#timer {
+display: none;
+width: fit-content;
+margin-top: 8px;
+padding: 8px 12px;
+background: #000d;
+border-radius: 10px;
+color: #ff5959;
+font-size: 20px;
+font-weight: bold;
+}
+#bottom {
+position: fixed;
+bottom: 0;
+left: 0;
+right: 0;
+padding: 10px 12px max(12px, env(safe-area-inset-bottom));
+background: linear-gradient(transparent, #000e);
+}
+#help {
+margin: 0 0 8px;
+text-align: center;
+font-size: 12px;
+text-shadow: 0 1px 4px #000;
+}
+#buttons {
+display: grid;
+grid-template-columns: repeat(3, 1fr);
+gap: 8px;
+max-width: 560px;
+margin: auto;
+}
+button, #download {
+min-height: 52px;
+border: 0;
+border-radius: 12px;
+font: bold 15px system-ui, sans-serif;
+color: #fff;
+background: #303641;
+touch-action: manipulation;
+-webkit-tap-highlight-color: transparent;
+}
+button:disabled { opacity: .4; }
+#record { background: #b71f36; }
+#photo { background: #126c90; }
+#download {
+display: none;
+align-items: center;
+justify-content: center;
+max-width: 560px;
+margin: 8px auto 0;
+padding: 10px;
+text-align: center;
+text-decoration: none;
+background: #166347;
+}
+input { display: none; }
+</style>
+</head>
+<body>
+<video id="source" autoplay muted playsinline></video>
+
+<main id="stage" aria-label="カメラと画像の合成画面">
+<canvas id="canvas" width="720" height="1280"></canvas>
+<div id="selection"></div>
+</main>
+
+<div id="top">
+<div id="status" role="status" aria-live="polite">
+カメラを起動しています…
+</div>
+<div id="timer" role="timer">● 録画中 0秒</div>
+</div>
+
+<div id="bottom">
+<p id="help">画像をタップして選択・１本指で移動・２本指で拡大縮小と回転</p>
+<div id="buttons">
+<button id="add">画像を追加</button>
+<button id="remove" disabled>選択を削除</button>
+<button id="switch" disabled>前面へ切替</button>
+<button id="record" disabled>録画</button>
+<button id="photo" disabled>写真</button>
+<button id="retry">カメラ再開</button>
+</div>
+<a id="download">保存できない場合はここをタップ</a>
+</div>
+
+<input id="files" type="file" accept="image/*" multiple>
+
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+const canvas = $("canvas");
+const ctx = canvas.getContext("2d", { alpha: false });
+const video = $("source");
+const stage = $("stage");
+const selection = $("selection");
+const W = canvas.width;
+const H = canvas.height;
+
+let camera = null;
+let facing = "environment";
+let cameraBusy = false;
+let recordBusy = false;
+let recorder = null;
+let recordingStream = null;
+let microphone = null;
+let timerID = null;
+let startedAt = 0;
+let downloadURL = null;
+let selected = null;
+let gesture = null;
+let images = [];
+const pointers = new Map();
+
+function message(text) {
+$("status").textContent = text;
+}
+
+function stopTracks(stream) {
+if (stream) stream.getTracks().forEach(track => track.stop());
+}
+
+function cameraReady() {
+return !!camera &&
+camera.getVideoTracks().some(track => track.readyState === "live") &&
+video.readyState >= 2;
+}
+
+function recording() {
+return !!recorder;
+}
+
+function updateButtons() {
+const ready = cameraReady();
+$("switch").disabled = cameraBusy || recordBusy || recording() || !ready;
+$("retry").disabled = cameraBusy || recordBusy || recording();
+$("photo").disabled = !ready;
+$("record").disabled = cameraBusy || recordBusy || !ready;
+$("remove").disabled = !selected;
+$("switch").textContent =
+facing === "environment" ? "前面へ切替" : "背面へ切替";
+$("record").textContent = recording() ? "録画停止" : "録画";
+}
+
+function permissionMessage(error, device) {
+switch (error.name) {
+case "NotAllowedError":
+case "SecurityError":
+return device + "の利用が許可されていません。\n" +
+"Chromeのアドレス欄左のサイト設定で許可してください。" +
+"必要ならAndroidの設定でもChromeの権限を確認してください。";
+case "NotFoundError":
+return device + "が見つかりません。端末の接続や設定を確認してください。";
+case "NotReadableError":
+return device + "を使用できません。他のカメラ・通話アプリを閉じて再試行してください。";
+default:
+return device + "を開始できませんでした。HTTPSで開いているか確認し、再試行してください。";
+}
+}
+
+async function startCamera(target = facing) {
+if (cameraBusy || recording() || recordBusy) return;
+
+if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+message("カメラを使うには、このHTMLをHTTPSのURLで開いてください。");
+return;
+}
+
+cameraBusy = true;
+updateButtons();
+message("カメラの許可を確認しています…");
+stopTracks(camera);
+camera = null;
+video.srcObject = null;
+
+try {
+camera = await navigator.mediaDevices.getUserMedia({
+video: {
+facingMode: { ideal: target },
+width: { ideal: 720 },
+height: { ideal: 1280 },
+frameRate: { ideal: 30, max: 30 }
+},
+audio: false
+});
+
+video.srcObject = camera;
+await video.play();
+
+const actual = camera.getVideoTracks()[0].getSettings().facingMode;
+facing = actual === "user" || actual === "environment" ? actual : target;
+
+camera.getVideoTracks()[0].addEventListener("ended", () => {
+if (recorder?.state === "recording") stopRecording();
+message("カメラが停止しました。「カメラ再開」を押してください。");
+updateButtons();
+});
+
+message("画像を追加して重ねられます。撮影・録画は縦長の画面全体を保存します。");
+} catch (error) {
+stopTracks(camera);
+camera = null;
+message(permissionMessage(error, "カメラ"));
+} finally {
+cameraBusy = false;
+updateButtons();
+}
+}
+
+function drawComposition() {
+ctx.fillStyle = "#000";
+ctx.fillRect(0, 0, W, H);
+
+if (video.readyState >= 2 && video.videoWidth && video.videoHeight) {
+const vw = video.videoWidth;
+const vh = video.videoHeight;
+const scale = Math.max(W / vw, H / vh);
+const sw = W / scale;
+const sh = H / scale;
+
+// 前面カメラも保存画像と同じ向きで表示する。
+ctx.drawImage(
+video,
+(vw - sw) / 2, (vh - sh) / 2, sw, sh,
+0, 0, W, H
+);
+}
+
+for (const item of images) {
+ctx.save();
+ctx.translate(item.x, item.y);
+ctx.rotate(item.angle);
+ctx.scale(item.scale, item.scale);
+ctx.drawImage(item.image, -item.w / 2, -item.h / 2, item.w, item.h);
+ctx.restore();
+}
+}
+
+function drawSelection() {
+if (!selected) {
+selection.style.display = "none";
+return;
+}
+
+const sx = stage.clientWidth / W;
+const sy = stage.clientHeight / H;
+const width = selected.w * selected.scale * sx;
+const height = selected.h * selected.scale * sy;
+
+Object.assign(selection.style, {
+display: "block",
+width: width + "px",
+height: height + "px",
+left: selected.x * sx - width / 2 + "px",
+top: selected.y * sy - height / 2 + "px",
+transform: `rotate(${selected.angle}rad)`
+});
+}
+
+function render() {
+drawComposition();
+drawSelection();
+requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+$("add").onclick = () => $("files").click();
+
+$("files").onchange = async event => {
+const files = Array.from(event.target.files || []);
+event.target.value = "";
+
+for (const file of files) {
+const url = URL.createObjectURL(file);
+try {
+const img = new Image();
+img.src = url;
+await img.decode();
+
+// 大きな画像を縮小し、メモリ消費を抑える。
+const ratio = Math.min(1, 2048 / Math.max(img.naturalWidth, img.naturalHeight));
+const bitmap = document.createElement("canvas");
+bitmap.width = Math.max(1, Math.round(img.naturalWidth * ratio));
+bitmap.height = Math.max(1, Math.round(img.naturalHeight * ratio));
+bitmap.getContext("2d").drawImage(img, 0, 0, bitmap.width, bitmap.height);
+
+const item = {
+image: bitmap,
+w: bitmap.width,
+h: bitmap.height,
+x: W / 2,
+y: H / 2,
+scale: Math.min(W * .6 / bitmap.width, H * .45 / bitmap.height),
+angle: 0
+};
+images.push(item);
+selected = item;
+updateButtons();
+} catch {
+message("読み込めない画像がありました。PNGやJPEGなどの画像を選んでください。");
+} finally {
+URL.revokeObjectURL(url);
+}
+}
+};
+
+$("remove").onclick = () => {
+images = images.filter(item => item !== selected);
+selected = null;
+gesture = null;
+updateButtons();
+};
+
+function position(event) {
+const rect = stage.getBoundingClientRect();
+return {
+x: (event.clientX - rect.left) * W / rect.width,
+y: (event.clientY - rect.top) * H / rect.height
+};
+}
+
+function hitTest(point, item) {
+const dx = point.x - item.x;
+const dy = point.y - item.y;
+const c = Math.cos(item.angle);
+const s = Math.sin(item.angle);
+const localX = (dx * c + dy * s) / item.scale;
+const localY = (-dx * s + dy * c) / item.scale;
+return Math.abs(localX) <= item.w / 2 &&
+Math.abs(localY) <= item.h / 2;
+}
+
+function beginGesture() {
+if (!selected || !pointers.size) {
+gesture = null;
+return;
+}
+const points = Array.from(pointers.values());
+if (points.length === 1) {
+gesture = {
+mode: 1,
+start: points[0],
+x: selected.x,
+y: selected.y
+};
+} else {
+const [a, b] = points;
+gesture = {
+mode: 2,
+center: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+distance: Math.max(1, Math.hypot(b.x - a.x, b.y - a.y)),
+angle: Math.atan2(b.y - a.y, b.x - a.x),
+x: selected.x,
+y: selected.y,
+scale: selected.scale,
+rotation: selected.angle
+};
+}
+}
+
+stage.addEventListener("pointerdown", event => {
+event.preventDefault();
+if (pointers.size >= 2) return;
+
+const p = position(event);
+if (pointers.size === 0) {
+selected = [...images].reverse().find(item => hitTest(p, item)) || null;
+if (selected) {
+images = images.filter(item => item !== selected);
+images.push(selected);
+}
+updateButtons();
+}
+
+pointers.set(event.pointerId, p);
+stage.setPointerCapture(event.pointerId);
+beginGesture();
+});
+
+stage.addEventListener("pointermove", event => {
+if (!pointers.has(event.pointerId)) return;
+event.preventDefault();
+pointers.set(event.pointerId, position(event));
+if (!gesture || !selected) return;
+
+const points = Array.from(pointers.values());
+if (gesture.mode === 1 && points.length === 1) {
+selected.x = gesture.x + points[0].x - gesture.start.x;
+selected.y = gesture.y + points[0].y - gesture.start.y;
+} else if (gesture.mode === 2 && points.length === 2) {
+const [a, b] = points;
+const center = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+const distance = Math.hypot(b.x - a.x, b.y - a.y);
+const delta = Math.atan2(b.y - a.y, b.x - a.x) - gesture.angle;
+const size = Math.max(selected.w, selected.h);
+const newScale = Math.max(
+24 / size,
+Math.min(W * 6 / size, gesture.scale * distance / gesture.distance)
+);
+const ratio = newScale / gesture.scale;
+const dx = gesture.x - gesture.center.x;
+const dy = gesture.y - gesture.center.y;
+
+selected.x = center.x + ratio * (dx * Math.cos(delta) - dy * Math.sin(delta));
+selected.y = center.y + ratio * (dx * Math.sin(delta) + dy * Math.cos(delta));
+selected.scale = newScale;
+selected.angle = gesture.rotation + delta;
+}
+
+selected.x = Math.max(0, Math.min(W, selected.x));
+selected.y = Math.max(0, Math.min(H, selected.y));
+});
+
+function endPointer(event) {
+if (!pointers.delete(event.pointerId)) return;
+beginGesture();
+}
+
+stage.addEventListener("pointerup", endPointer);
+stage.addEventListener("pointercancel", endPointer);
+stage.addEventListener("lostpointercapture", endPointer);
+
+function filename(prefix, extension) {
+const d = new Date();
+const pad = n => String(n).padStart(2, "0");
+const stamp = d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) +
+"_" + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
+return prefix + "_" + stamp + "." + extension;
+}
+
+function saveBlob(blob, name) {
+if (downloadURL) URL.revokeObjectURL(downloadURL);
+downloadURL = URL.createObjectURL(blob);
+const link = $("download");
+link.href = downloadURL;
+link.download = name;
+link.textContent = "保存できない場合はここをタップ";
+link.style.display = "flex";
+link.click();
+}
+
+$("photo").onclick = () => {
+if (!cameraReady()) return;
+drawComposition();
+canvas.toBlob(blob => {
+if (!blob) {
+message("写真を保存できませんでした。もう一度お試しください。");
+return;
+}
+saveBlob(blob, filename("合成写真", "png"));
+message("写真の保存を開始しました。保存されない場合は下のリンクを押してください。");
+}, "image/png");
+};
+
+function cleanupRecording() {
+clearInterval(timerID);
+timerID = null;
+stopTracks(recordingStream);
+stopTracks(microphone);
+recordingStream = null;
+microphone = null;
+recorder = null;
+recordBusy = false;
+$("timer").style.display = "none";
+updateButtons();
+}
+
+async function startRecording() {
+if (recordBusy || recording() || !cameraReady()) return;
+
+if (!window.MediaRecorder || !canvas.captureStream) {
+message("このブラウザは合成録画に対応していません。Chromeを更新してください。");
+return;
+}
+
+recordBusy = true;
+updateButtons();
+
+try {
+message("録音のため、マイクの利用を許可してください。");
+try {
+microphone = await navigator.mediaDevices.getUserMedia({ audio: true });
+} catch (error) {
+message(permissionMessage(error, "マイク") +
+"\n録画は開始していません。写真撮影は利用できます。");
+cleanupRecording();
+return;
+}
+
+if (document.hidden || !cameraReady()) {
+message("画面を開いた状態でカメラを再開してから録画してください。");
+cleanupRecording();
+return;
+}
+
+drawComposition();
+recordingStream = canvas.captureStream(30);
+microphone.getAudioTracks().forEach(track => recordingStream.addTrack(track));
+
+const types = [
+"video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+"video/mp4",
+"video/webm;codecs=vp9,opus",
+"video/webm;codecs=vp8,opus",
+"video/webm"
+];
+
+let active = null;
+for (const type of types) {
+if (!MediaRecorder.isTypeSupported(type)) continue;
+try {
+active = new MediaRecorder(recordingStream, {
+mimeType: type,
+videoBitsPerSecond: 4000000,
+audioBitsPerSecond: 128000
+});
+break;
+} catch {
+// この形式で初期化できなければ次の形式を試す。
+}
+}
+
+if (!active) {
+throw new Error("対応形式なし");
+}
+
+recorder = active;
+const chunks = [];
+let failed = false;
+
+active.ondataavailable = event => {
+if (event.data.size > 0) chunks.push(event.data);
+};
+
+active.onerror = () => {
+failed = true;
+message("録画中にエラーが発生しました。保存できた部分があれば出力します。");
+if (active.state !== "inactive") {
+try { active.stop(); } catch { cleanupRecording(); }
+}
+};
+
+active.onstop = () => {
+const type = chunks[0]?.type || active.mimeType;
+const extension = type.includes("mp4") ? "mp4" : "webm";
+const blob = new Blob(chunks, { type });
+cleanupRecording();
+
+if (blob.size) {
+saveBlob(blob, filename("合成動画", extension));
+message(failed
+? "録画が中断されました。保存した動画を確認してください。"
+: "動画の保存を開始しました。保存されない場合は下のリンクを押してください。");
+} else {
+message("動画データがありません。少し長めに録画して再試行してください。");
+}
+};
+
+active.start(1000);
+startedAt = performance.now();
+$("timer").textContent = "● 録画中 0秒";
+$("timer").style.display = "block";
+timerID = setInterval(() => {
+const seconds = Math.floor((performance.now() - startedAt) / 1000);
+$("timer").textContent = "● 録画中 " + seconds + "秒";
+}, 200);
+
+recordBusy = false;
+updateButtons();
+message("録画中です。画像の移動・拡大縮小・回転も記録されます。\n画面を開いたままお使いください。");
+} catch {
+cleanupRecording();
+message("録画を開始できませんでした。Chromeを更新するか、他のアプリを閉じて再試行してください。");
+}
+}
+
+function stopRecording() {
+if (!recorder || recorder.state === "inactive") return;
+recordBusy = true;
+updateButtons();
+message("動画を保存しています…");
+try {
+recorder.stop();
+} catch {
+cleanupRecording();
+message("録画を停止できませんでした。もう一度録画してください。");
+}
+}
+
+$("record").onclick = () => {
+if (recording()) stopRecording();
+else startRecording();
+};
+
+$("switch").onclick = () => {
+startCamera(facing === "environment" ? "user" : "environment");
+};
+
+$("retry").onclick = () => startCamera();
+
+document.addEventListener("visibilitychange", () => {
+if (document.hidden && recorder?.state === "recording") {
+stopRecording();
+}
+});
+
+window.addEventListener("pagehide", () => {
+if (recorder?.state === "recording") {
+try { recorder.stop(); } catch {}
+}
+stopTracks(camera);
+stopTracks(microphone);
+});
+
+window.addEventListener("pageshow", event => {
+if (event.persisted) {
+message("「カメラ再開」を押してカメラを起動してください。");
+updateButtons();
+}
+});
+
+startCamera();
+</script>
+</body>
+</html>
